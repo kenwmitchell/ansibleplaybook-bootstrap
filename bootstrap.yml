@@ -1,0 +1,116 @@
+---
+
+# this playbook gets run once and only once for each new server.
+# it assumes the server has one user account with root privilges
+
+# only changes made to server: (1) gave static ip address (2) install openssh-server 
+# if getting ssh errors during re-build using diff host with same ip address:
+# ssh-keygen -f "/home/cisco/.ssh/known_hosts" -R 192.168.1.53
+# if you use the dhcp ip to push the first few playbooks, don't forget to create add a new host file 
+##############################################################
+# this playbook needs to be run with --ask-sudo-pass -k 
+#
+# ansible-playbook bootstrap.yml --extra-vars "target=192.168.1.1" --list-hosts
+##############################################################
+
+- name: one-time server build
+  hosts: bootstrap
+  gather_facts: no
+  remote_user: root
+  vars:
+    user_name: user
+    user_pass: password
+    sshd: sshd
+    sshd_config: /etc/ssh/sshd_config
+    ssh_identity_key: ./files/id_rsa.pub
+    ssh_port: 22
+
+  tasks:
+
+  - name: Upgrade all packages
+    yum: name=* state=latest
+
+  - name: Install selinux bindings
+    yum: name=libselinux-python state=present
+
+  - name: Create wheel group
+    group: name=wheel state=present
+
+  - name: Create user and set password
+    user: name={{ user_name }} password={{ user_pass }} groups=wheel
+
+  - name: Add identiy key to authorized keys on host
+    authorized_key: user={{ user_name }} key="{{ lookup('file', ssh_identity_key) }}" #"
+    register: add_identity_key
+    when: ssh_identity_key is defined and user_name is defined
+
+  - name: Add user into sudoers
+    lineinfile: dest=/etc/sudoers regexp="^\%wheel ALL" line="%wheel ALL=(ALL) ALL" state=present
+
+  - name: Change ssh listening port
+    lineinfile: dest={{ sshd_config }} regexp="^#?Port" line="Port 1969"
+    notify: restart sshd
+
+  - name: Disable empty password login
+    lineinfile: dest={{ sshd_config }} regexp="^#?PermitRootLogin" line="PermitRootLogin no"
+    notify: restart sshd
+
+  - name: Disable protocal 1
+    lineinfile: dest={{ sshd_config }} regexp="^#?Protocol" line="Protocol 2"
+    notify: restart sshd
+
+  - name: Disable DNS lookups
+    lineinfile: dest={{ sshd_config }} regexp="^#?UseDNS" line="UseDNS no"
+    notify: restart sshd
+
+  - name: Disable password login
+    lineinfile: dest={{ sshd_config }} regexp="^#?PasswordAuthentication" line="PasswordAuthentication no"
+    when: add_identity_key|success and not add_identity_key|skipped
+    notify: restart sshd 
+
+  - name: iptables | default ACCEPT
+    command: /sbin/iptables -P INPUT ACCEPT
+
+  - name: iptables | flush
+    command: /sbin/iptables -F
+
+  - name: iptables | delete
+    command: /sbin/iptables -X
+
+  - name: iptables | local ACCEPT
+    command: /sbin/iptables -A INPUT -i lo -j ACCEPT
+
+  - name: iptables | ESTABLISHED, RELATED ACCEPT
+    command: /sbin/iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+  - name: iptables | {{ ssh_port }} record
+    command: /sbin/iptables -A INPUT -p tcp --dport {{ ssh_port }} -m state --state NEW -m recent --set --name ssh --rsource
+
+  - name: iptables | {{ ssh_port }} ACCEPT if not repeated
+    command: /sbin/iptables -A INPUT -p tcp --dport {{ ssh_port }} -m state --state NEW -m recent ! --rcheck --seconds 60 --hitcount 4 --name ssh --rsource -j ACCEPT
+
+  - name: iptables | default INPUT DROP
+    command: /sbin/iptables -P INPUT DROP
+
+  - name: iptables | default FORWARD DROP
+    command: /sbin/iptables -P FORWARD DROP
+
+  - name: iptables | default OUTPUT ACCEPT
+    command: /sbin/iptables -P OUTPUT ACCEPT
+
+  - name: iptables | iptables save
+    command: /sbin/service iptables save
+    notify: 
+      - restart iptables
+
+  handlers:
+
+  - name: restart sshd
+    service: name={{ sshd }} state=restarted
+
+  - name: restart iptables
+    service: name=iptables state=restarted
+
+
+##########playbook series##########
+
